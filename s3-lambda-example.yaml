@@ -1,0 +1,280 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Metadata:
+  AWS::CloudFormation::Interface: 
+    ParameterGroups: 
+      - 
+        Label: 
+          default: "Stack Configuration"
+        Parameters: 
+          - Owner
+      - 
+        Label: 
+          default: "Resource Configuration"
+        Parameters: 
+          - Email        
+          - TagName
+          - TagValue
+    ParameterLabels: 
+      Email: 
+        default: "What email should notifications be sent to?"
+      TagName: 
+        default: "What do you want to call your custom tag?"
+      TagValue: 
+        default: "What should the custom tag value be set to?"
+
+Parameters:
+  Owner:
+    Type: String
+    Default: "unknown"
+    Description: Enter stack owner
+  Email:
+    Type: String
+    Description: Enter email for notifications
+  TagName:
+    Type: String
+    Default: "CustomTag"
+  TagValue:
+    Type: String
+    Default: "DefaultValue"
+
+Resources:
+  RandomValue:
+    Type: 'AWS::SecretsManager::Secret'
+    DeletionPolicy: Delete
+    Properties:
+      Name: RandomValue
+      Description: "This secret has a dynamically generated value to use in resource names."
+      GenerateSecretString:
+        PasswordLength: 6
+        ExcludePunctuation: true
+        ExcludeUppercase: true
+      Tags:
+        - Key: Project
+          Value: "Cloudformation example"
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: !Ref TagName
+          Value: !Ref TagValue
+
+  S3Bucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub
+        - 'source-bucket-${secret}'
+        - secret: !Join [ '', [ '{{resolve:secretsmanager:RandomValue:SecretString}}' ] ]
+      AccessControl: BucketOwnerFullControl
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt Lambda.Arn
+      Tags:
+        - Key: Name
+          Value: FileManagementSourceBucket
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: !Ref TagName
+          Value: !Ref TagValue
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    DeletionPolicy: Delete
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+        
+  LambdaPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    DeletionPolicy: Delete
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectAcl
+              - s3:GetObjectVersionAcl
+              - s3:GetObjectTagging
+              - s3:GetObjectVersion
+              - s3:PutObjectTagging
+              - s3:PutObject
+              - s3:PutObjectAcl
+              - s3:PutObjectTagging
+              - s3:PutObjectVersionAcl
+              - s3:PutObjectVersionTagging
+              - s3:DeleteObject
+              - s3:DeleteObjectVersionTagging
+              - s3:DeleteObjectVersion
+              - s3:DeleteObjectTagging
+            Resource:
+              - !Sub ${ProcessedBucket.Arn}/*
+              - !Sub ${S3Bucket.Arn}/*
+          - Effect: Allow
+            Action:
+              - s3:ListBucket
+            Resource:
+              - !Sub ${ProcessedBucket.Arn}
+              - !Sub ${S3Bucket.Arn}
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - arn:aws:logs:*:*:*
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - arn:aws:logs:*:*:*
+      Roles:
+        - Ref: LambdaRole
+
+  S3Permissions:
+    Type: AWS::Lambda::Permission
+    DeletionPolicy: Delete
+    Properties:
+      FunctionName: !GetAtt Lambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn:  !Sub
+        - 'arn:aws:s3:::source-bucket-${secret}'
+        - secret: !Join [ '', [ '{{resolve:secretsmanager:RandomValue:SecretString}}' ] ]
+
+  Lambda:
+    Type: AWS::Lambda::Function
+    DeletionPolicy: Delete
+    Properties:
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          from datetime import datetime
+
+          s3_client = boto3.client("s3")
+          
+          def lambda_handler(event, context):
+            source_bucket_name = event['Records'][0]['s3']['bucket']['name']
+            destination_bucket_name = '${ProcessedBucket}'
+            original_file = event['Records'][0]['s3']['object']['key']
+            source_file = original_file.replace("+", " ")
+            date = datetime.now().strftime("%Y/%m/%d")
+            destination_file = date+'/'+original_file
+            action = "move file"
+            response = s3_client.put_object_tagging(
+              Bucket = source_bucket_name,
+              Key = source_file,
+              Tagging={
+                  'TagSet': [
+                      {
+                          'Key': 'Recieved',
+                          'Value':  event['Records'][0]['eventTime'],
+                      },
+                      {
+                          'Key': 'Original Size',
+                          'Value':  str(event['Records'][0]['s3']['object']['size']),
+                      },
+                      {
+                          'Key': 'Uploaded From',
+                          'Value':  event['Records'][0]['requestParameters']['sourceIPAddress'],
+                      },
+                  ],
+              },
+            )
+            
+            response = s3_client.copy_object(
+              Bucket = destination_bucket_name,
+              CopySource = {'Bucket': source_bucket_name, 'Key': source_file},
+              Key = destination_file,
+              )
+            
+            response = s3_client.delete_object(
+              Bucket=source_bucket_name,
+              Key=source_file,
+            )
+            return action
+      Description: Lambda to manage files
+      FunctionName: !Sub ${AWS::StackName}-file-lambda
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      MemorySize: 128
+      Timeout: 60
+      Role: !GetAtt LambdaRole.Arn
+      Tags:
+        - Key: Name
+          Value: FileManagementLambda
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: !Ref TagName
+          Value: !Ref TagValue
+
+  ProcessedBucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Retain
+    DependsOn: ProcessedEmail
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Topic: !Ref ProcessedEmail
+            Event: 's3:ObjectCreated:*'
+      Tags:
+        - Key: Name
+          Value: FileManagementProcessedBucket
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: !Ref TagName
+          Value: !Ref TagValue
+
+  ProcessedEmail:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: S3Notifications
+      Subscription:
+      - Endpoint: !Ref Email
+        Protocol: email
+
+  SNSPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties: 
+      PolicyDocument:
+        Statement:
+          - Sid: AllowAWS
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action:
+              - 'sns:Publish'
+            Resource: !Ref ProcessedEmail
+          - Sid: AllowS3
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - "sns:Publish"
+            Resource: !Ref ProcessedEmail
+      Topics:
+        - !Ref ProcessedEmail
